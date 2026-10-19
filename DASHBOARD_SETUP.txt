@@ -1,0 +1,37 @@
+REMOTE DESKTOP 2.1.0 - COORDINATED UPGRADE REQUIRED
+
+See INSTALL_GUIDE.md for complete setup.
+Deploy relay_server.py and requirements.txt to your HTTPS service.
+Set DASHBOARD_PASSWORD to a unique password of at least 16 characters.
+There is no default password. On Render Free, set DATABASE_URL to a free external
+PostgreSQL database with verified TLS. Run python relay_server.py --init-db once
+before normal startup. This creates a NEW empty registry; it does not migrate
+old STATE_FILE registrations. Never initialize automatically on every startup.
+Alternatively, set STATE_FILE on durable storage in an existing writable directory.
+Use one server process and one service per database, not multiple workers.
+Configure /healthz as the health-check path. Keep database credentials only in
+Render environment settings, not source files or desktop applications.
+
+Set TRUST_PROXY=1 only behind a trusted TLS proxy that overwrites
+X-Forwarded-Proto and prevents direct public access to the backend.
+Never log X-RemoteDesktop-Auth: it contains credentials.
+Do not set ALLOW_INSECURE_LOCALHOST in production.
+
+Issue a one-time pairing code in the authenticated dashboard. Paste it into the
+Host first-run wizard and choose a separate access passphrase. The code expires
+after 15 minutes. Host saves its protected identity before sending the request,
+so a lost response can be retried with the same code and identity before expiry.
+Manual MAC enrollment and key rotation remain available for administrator recovery.
+Machines no longer enroll automatically. Token rotation disconnects sessions
+and requires updating the Host key; arrange alternate access first.
+
+Update Host, Client and relay together. Six digits alone no longer authorize
+control. Clearing a code requests a new one, which is then persisted.
+
+Defaults reference https://my-relay-1.onrender.com/. Building locally never deploys
+the server. See RELEASE_STATUS.md for separately verified deployment status.
+Executable auto-update is not supported. Free services have quotas and cold starts.
+
+After a post-replacement durability failure, relay reconciles memory to the
+written registry and disconnects all pairs. Fix storage and reissue any key
+that was not returned. A failed rotation may have already revoked the old key.

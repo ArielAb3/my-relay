@@ -1,2 +1,4 @@
 websockets>=11.0,<14.0
-aiohttp>=3.9
+aiohttp>=3.14.5,<4
+psycopg[binary]>=3.2,<4
+certifi>=2025.1.31
