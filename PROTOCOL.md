@@ -66,6 +66,11 @@ Desktop programs reject successful replies missing protocol 2.
 Relay to Host: set_code with code (six ASCII digits or empty), wake with mac,
 and disconnected. Host saves set_code and reconnects even during a session.
 Dashboard desired_code takes priority. Client text is never forwarded to Host.
+After authenticating a Host, the relay ignores a locally requested code that is
+reserved to another offline machine. A claim on another live session still fails.
+The relay reuses the Host's own assignment or allocates
+a free code. An administrator reservation remains authoritative.
+Confirming the current code on the dashboard keeps an active session connected.
 Host to Client: `{type:"file_result", ok:true, name}` after committed file receipt.
 
 ## Binary Frames
@@ -103,6 +108,9 @@ transfers terminate the session; Client awaits each chunk send.
 
 Private routes require Basic Auth/HTTPS, DASHBOARD_PASSWORD >=16 characters.
 GET /api/machines never returns tokens or password verifiers.
+Each machine has an `in_use` boolean for a connected operator, separate from
+`online` for a registered Host. Dashboard quota exhaustion returns HTTP 429
+and a Retry-After header. Desktop and dashboard request quotas are independent.
 POST /api/enroll JSON {mac}: returns {ok:true,mac,host_token} once, revokes old pairs.
 POST /api/set JSON {mac,code?,name?}; POST /api/wake JSON {mac}.
 Mutations require X-Requested-With: RemoteDesktop and same-origin requests.

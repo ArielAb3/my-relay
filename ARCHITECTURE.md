@@ -62,7 +62,8 @@ literal loopback for tests only. No certificate-validation bypasses.
 
 Limits: 128 connection/auth slots, 16 per transport peer, four hashes, 60 attempts per transport peer,
 10 per code, 240 global per 60 seconds, including successes. Dashboard requests
-share quotas; polling/multiple operators consume them. This bounds work, not all
+use independently bounded global and peer quotas. Polling pauses when the dashboard
+is hidden and backs off for a minute on HTTP 429. This bounds work, not all
 denial of service. Wider deployments need appropriate edge/network protection.
 
 If directory durability fails after a state replacement, relay reconciles memory

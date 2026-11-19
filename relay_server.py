@@ -90,10 +90,10 @@ def valid_code(value):
     return isinstance(value, str) and re.fullmatch(r'[0-9]{6}', value) is not None
 
 
-def attempt(app, peer, code=None):
+def attempt(app, peer, code=None, *, dashboard=False):
     state = app[SECURITY]
     now = time.monotonic()
-    buckets = state['attempts']
+    buckets = state['dashboard_attempts' if dashboard else 'attempts']
     for key in list(buckets):
         q = buckets[key]
         while q and q[0] <= now - AUTH_WINDOW:
@@ -412,6 +412,12 @@ def mark_stale():
         m['online'] = ws is not None and not ws.closed
 
 
+def reserved_for_other(code, mac):
+    session = sessions.get(code)
+    return (session is not None and session['mac'] != mac) or any(
+        key != mac and code in (m.get('desired_code'), m.get('code')) for key, m in machines.items())
+
+
 def serialized(handler):
     @wraps(handler)
     async def wrapper(request, *args):
@@ -554,12 +560,12 @@ async def ws_endpoint(request):
             supplied = msg.get('preferred_code', '')
             if not isinstance(supplied, str) or (supplied and not valid_code(supplied)):
                 raise ValueError('Authentication failed')
+            if supplied and not desired and supplied not in sessions and reserved_for_other(supplied, mac):
+                supplied = ''
             preferred = desired or supplied or m.get('code')
             code = gen_code(preferred)
             previous = sessions.get(code)
-            reserved = any(key != mac and code in (m.get('desired_code'), m.get('code'))
-                           for key, m in machines.items())
-            if reserved or (previous and previous.get('mac') != mac):
+            if reserved_for_other(code, mac):
                 raise ValueError('Authentication failed')
             original_machine = m
             original_control = host_ctrl.get(mac)
@@ -703,7 +709,9 @@ async def ws_endpoint(request):
 #  HTTP endpoints
 # ============================================================
 def check_auth(request):
-    if not attempt(request.app, transport_peer(request)) or len(DASHBOARD_PASSWORD) < 16:
+    if not attempt(request.app, transport_peer(request), dashboard=True):
+        raise web.HTTPTooManyRequests(text='Try again later', headers={'Retry-After': str(AUTH_WINDOW)})
+    if len(DASHBOARD_PASSWORD) < 16:
         return False
     auth = request.headers.get('Authorization', '')
     if not auth.startswith('Basic '):
@@ -736,9 +744,11 @@ async def api_machines(request):
         return need_auth()
     mark_stale()
     now = int(time.time())
+    in_use = {s['mac'] for s in sessions.values()
+              if s.get('client') is not None and not s['client'].closed}
     out = [{
         'mac': mac, 'name': m.get('name', ''), 'code': m.get('code', ''),
-        'desired_code': m.get('desired_code', ''), 'online': bool(m.get('online')),
+        'desired_code': m.get('desired_code', ''), 'online': bool(m.get('online')), 'in_use': mac in in_use,
         'version': m.get('version', '?'), 'ip': m.get('ip', '?'),
         'last_seen': int(m.get('last_seen', 0)),
     } for mac, m in machines.items()]
@@ -804,14 +814,14 @@ async def api_set(request):
     if mac not in machines:
         raise web.HTTPBadRequest(text='Unknown machine')
     m = machines[mac].copy()
+    notify_host = False
     if 'code' in data:
         nc = data['code']
         if nc != '' and not valid_code(nc):
             raise web.HTTPBadRequest(text='Invalid code')
-        if nc and (any(key != mac and nc in (item.get('desired_code'), item.get('code'))
-                       for key, item in machines.items())
-                   or (nc in sessions and sessions[nc].get('mac') != mac)):
+        if nc and reserved_for_other(nc, mac):
             return web.json_response({'ok': False, 'err': 'code already assigned'}, status=409)
+        notify_host = not nc or nc != m.get('code') or m.get('desired_code') not in ('', None, nc)
         m['desired_code'] = nc
         if not nc:
             m['code'] = ''
@@ -820,7 +830,7 @@ async def api_set(request):
             raise web.HTTPBadRequest(text='Invalid name')
         m['name'] = data['name'].strip()[:40]
     await commit_machine(mac, m, request.app)
-    if 'code' in data:
+    if notify_host:
         ws = host_ctrl.get(mac)
         if ws is not None and not ws.closed:
             try: await ws.send_json({'type': 'set_code', 'code': data['code']})
@@ -944,56 +954,79 @@ DASHBOARD_HTML = r"""<!doctype html>
  button{background:var(--blue);color:#fff;border:0;border-radius:8px;padding:7px 14px;cursor:pointer;font-size:13px;font-weight:600}
  button.ghost{background:#26334a}button.wake{background:#8e44ad}.spacer{flex:1}
  .empty{color:var(--mut);text-align:center;padding:40px}
+ summary{cursor:pointer;padding:8px 0;color:var(--mut)}.meta,.code{unicode-bidi:plaintext}
+ [role=status]{font-size:14px;margin:6px 0}button:disabled{opacity:.55;cursor:default}
  .pill{font-size:11px;padding:2px 8px;border-radius:20px;background:#26334a;color:var(--mut)}
  .pill.onl{background:rgba(46,204,113,.15);color:var(--grn)}
 </style></head><body>
-<header><div><h1>🖥️ ניהול חיבורים מרחוק</h1><div class="sub">רענון אוטומטי כל 3 שניות</div></div>
+<header><div><h1>ניהול חיבורים מרחוק</h1></div>
 <div id="count" class="pill"></div></header>
-<div class="wrap"><div id="list" class="grid"><div class="empty">טוען…</div></div></div>
+<div class="wrap"><div id="loadStatus" role="status"></div><div id="list" class="grid"><div class="empty">טוען…</div></div></div>
 <script>
 function el(tag,cls,text){const n=document.createElement(tag);if(cls)n.className=cls;if(text!==undefined)n.textContent=String(text);return n;}
-function button(parent,label,action,cls){const b=el('button',cls,label);b.addEventListener('click',()=>Promise.resolve().then(action).catch(()=>alert('הפעולה נכשלה')));parent.append(b);}
+function button(parent,label,action,cls){const b=el('button',cls,label);b.addEventListener('click',async()=>{b.disabled=true;try{await action();}catch{alert('הפעולה נכשלה');}finally{b.disabled=false;}});parent.append(b);return b;}
 async function post(path,data){const r=await fetch(path,{method:'POST',headers:{'Content-Type':'application/json','X-Requested-With':'RemoteDesktop'},body:JSON.stringify(data)});if(!r.ok)throw new Error('Request failed');return r.json();}
-async function load(){try{const r=await fetch('/api/machines',{cache:'no-store'});if(!r.ok)throw new Error();const d=await r.json();if(!document.querySelector('#list input:focus'))render(d.machines,d.now);}catch(e){document.getElementById('list').replaceChildren(el('div','empty','שגיאת חיבור'));}}
+let loading=false, retryAt=0;
+async function load(){
+ if(loading||document.hidden||Date.now()<retryAt)return;
+ loading=true;
+ const status=document.getElementById('loadStatus');
+ try{
+  const r=await fetch('/api/machines',{cache:'no-store'});
+  if(r.status===429){retryAt=Date.now()+60000;status.textContent='הרענון הושהה לדקה. המצב המוצג עשוי להשתנות.';return;}
+  if(!r.ok)throw new Error();
+  const d=await r.json();status.textContent='';
+  if(!document.querySelector('#list input:focus'))render(d.machines,d.now);
+ }catch{status.textContent='אין עדכון מהשרת. המצב המוצג הוא מהבדיקה האחרונה.';}
+ finally{loading=false;}
+}
 function ago(ts,now){const s=now-ts;if(s<60)return s+' שניות';if(s<3600)return Math.floor(s/60)+' דק׳';return Math.floor(s/3600)+' שע׳';}
 async function enroll(mac){const d=await post('/api/enroll',{mac});prompt('מפתח Host חדש (מוצג פעם אחת):',d.host_token);load();}
 const enrollBar=el('div','row');enrollBar.style.marginBottom='12px';
 const macInput=el('input');macInput.placeholder='AA:BB:CC:DD:EE:FF';macInput.maxLength=17;
 enrollBar.append(macInput);button(enrollBar,'רישום מחשב',()=>enroll(macInput.value.trim()));
-document.querySelector('.wrap').prepend(enrollBar);
+const manual=el('details');manual.append(el('summary','','רישום ידני לפי MAC'),enrollBar);
+document.querySelector('.wrap').prepend(manual);
 const inviteBar=el('div','row');inviteBar.style.marginBottom='12px';
 const inviteCode=el('input');inviteCode.readOnly=true;inviteCode.dir='ltr';inviteCode.setAttribute('aria-label','קוד צימוד');inviteCode.style.maxWidth='100%';inviteCode.style.width='320px';
-const inviteStatus=el('span','sub');
-button(inviteBar,'קוד צימוד חדש',async()=>{const d=await post('/api/invite',{});inviteCode.value=d.pairing_code;inviteStatus.textContent='חד־פעמי · בתוקף ל־15 דקות';});
-inviteBar.append(inviteCode);button(inviteBar,'העתק קוד',async()=>{if(!inviteCode.value)return;await navigator.clipboard.writeText(inviteCode.value);inviteStatus.textContent='הקוד הועתק';},'ghost');
+const inviteStatus=el('span','sub');inviteStatus.setAttribute('role','status');
+button(inviteBar,'הוספת מחשב',async()=>{const d=await post('/api/invite',{});inviteCode.hidden=false;copyInvite.hidden=false;inviteCode.value=d.pairing_code;inviteStatus.textContent='הדביקו את הקוד ב־Host במחשב החדש ובחרו סיסמת גישה. הקוד תקף ל־15 דקות.';});
+inviteCode.hidden=true;inviteBar.append(inviteCode);
+const copyInvite=button(inviteBar,'העתק קוד צימוד',async()=>{try{await navigator.clipboard.writeText(inviteCode.value);}catch{inviteCode.select();inviteStatus.textContent='הקוד מסומן. לחצו Ctrl+C להעתקה.';return;}inviteStatus.textContent='הקוד הועתק. הדביקו אותו ב־Host במחשב החדש.';},'ghost');
+copyInvite.hidden=true;
 inviteBar.append(inviteStatus);document.querySelector('.wrap').prepend(inviteBar);
 function render(ms,now){
- const list=document.getElementById('list');list.replaceChildren();
+ const list=document.getElementById('list');
+ const expanded=new Set(Array.from(list.querySelectorAll('details[open]'),item=>item.dataset.mac));
+ list.replaceChildren();
  document.getElementById('count').textContent=ms.filter(m=>m.online).length+' מחוברים / '+ms.length+' סה״כ';
  if(!ms.length){list.append(el('div','empty','אין מחשבים רשומים עדיין.'));return;}
  for(const m of ms){
   const card=el('div','card'),row=el('div','row'),info=el('div');
   info.append(el('div','name',m.name||m.mac),el('div','meta',m.mac+' · v'+m.version+' · '+m.ip));
-  row.append(el('div','dot '+(m.online?'on':'off')),info,el('div','spacer'),el('span','pill '+(m.online?'onl':''),m.online?'אונליין':'אופליין · '+ago(m.last_seen,now)));
+  const state=m.in_use?'בשימוש':m.online?'מוכן לחיבור':m.last_seen?'אופליין · '+ago(m.last_seen,now):'טרם התחבר';
+  row.append(el('div','dot '+(m.online?'on':'off')),info,el('div','spacer'),el('span','pill '+(m.online?'onl':''),state));
   const controls=el('div','row');controls.style.marginTop='12px';
   const current=el('div');current.append(el('div','meta','קוד נוכחי'),el('div','code',m.code||'------'));
   const code=el('input','codein');code.placeholder='קוד קבוע';code.value=m.desired_code||'';code.maxLength=6;
-  controls.append(current,el('div','spacer'),code);
+  controls.append(code);
   button(controls,'קבע קוד',async()=>{const v=code.value.trim();if(v&&!/^[0-9]{6}$/.test(v)){alert('קוד חייב 6 ספרות');return;}await post('/api/set',{mac:m.mac,code:v});load();});
   const name=el('input');name.placeholder='שם מחשב';name.value=m.name||'';name.style.width='140px';controls.append(name);
   button(controls,'שמור שם',async()=>{await post('/api/set',{mac:m.mac,name:name.value.trim()});load();},'ghost');
   if(!m.online)button(controls,'הדלק',async()=>{const d=await post('/api/wake',{mac:m.mac});alert('נשלח דרך '+d.asked+' מחשבים');},'wake');
   button(controls,'החלף מפתח',()=>{if(confirm('להחליף מפתח ולנתק את החיבור הקיים?'))return enroll(m.mac);},'ghost');
-  card.append(row,controls);list.append(card);
+  const options=el('details');options.dataset.mac=m.mac;options.open=expanded.has(m.mac);
+  options.append(el('summary','','אפשרויות מחשב'),controls);
+  card.append(row,current,options);list.append(card);
  }
 }
-load();setInterval(load,3000);
+load();setInterval(load,10000);document.addEventListener('visibilitychange',load);
 </script></body></html>"""
 
 
 def make_app():
     app = web.Application(middlewares=[security_middleware], client_max_size=8192)
-    app[SECURITY] = {'attempts': {}, 'ws_count': 0, 'ws_peers': {}, 'hash_count': 0,
+    app[SECURITY] = {'attempts': {}, 'dashboard_attempts': {}, 'ws_count': 0, 'ws_peers': {}, 'hash_count': 0,
                      'executor': ThreadPoolExecutor(max_workers=MAX_HASHES),
                      'state_lock': asyncio.Lock(), 'mutations': set(), 'state_failed': False, 'store': None,
                      'pair_reads': 0, 'pair_peers': {}}

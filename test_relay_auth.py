@@ -72,6 +72,45 @@ class RelayAuthTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(reply['type'], 'error')
         self.assertFalse(relay.sessions)
 
+    async def test_dashboard_polling_cannot_block_desktop_login(self):
+        token = await self.enroll()
+        with patch.object(relay, 'IP_ATTEMPTS', 3):
+            for _ in range(2):
+                self.assertEqual((await self.client.get('/api/machines', headers=self.auth)).status, 200)
+            _, result = await self.ws(self.host_msg(token))
+            self.assertEqual(result['type'], 'code')
+            _, result = await self.ws(dict(role='client', protocol=2, code=result['code'], password=PASSWORD))
+            self.assertEqual(result['type'], 'connected')
+
+    async def test_stale_local_code_uses_own_assignment_and_preserves_other_machine(self):
+        token = await self.enroll()
+        other_mac = 'AA:BB:CC:DD:EE:02'
+        await self.post('/api/enroll', {'mac': other_mac})
+        await self.post('/api/set', {'mac': other_mac, 'code': '123456'})
+        _, first = await self.ws(self.host_msg(token))
+        self.assertEqual(first['type'], 'code')
+        self.assertNotEqual(first['code'], '123456')
+        _, second = await self.ws(self.host_msg(token))
+        self.assertEqual(second['code'], first['code'])
+        self.assertEqual(relay.machines[other_mac]['desired_code'], '123456')
+
+    async def test_dashboard_distinguishes_available_from_in_use(self):
+        token = await self.enroll()
+        await self.ws(self.host_msg(token))
+        async def in_use():
+            response = await self.client.get('/api/machines', headers=self.auth)
+            return (await response.json())['machines'][0].get('in_use')
+        self.assertIs(await in_use(), False)
+        operator, _ = await self.ws(dict(role='client', protocol=2, code='123456', password=PASSWORD))
+        self.assertIs(await in_use(), True)
+        host_socket = self.sockets[0]
+        self.assertEqual((await host_socket.receive_json(timeout=2))['type'], 'connected')
+        response = await self.post('/api/set', {'mac': MAC, 'code': '123456'})
+        self.assertEqual(response.status, 200)
+        await operator.close()
+        self.assertEqual((await host_socket.receive_json(timeout=2))['type'], 'disconnected')
+        self.assertIs(await in_use(), False)
+
     async def test_header_auth_rejects_before_upgrade(self):
         for header in [None, '!!!', base64.b64encode(b'x'*4097).decode(),
                        base64.b64encode(b'[]').decode()]:
@@ -294,7 +333,8 @@ class RelayAuthTests(unittest.IsolatedAsyncioTestCase):
                 r = await self.client.get('/api/machines', headers=self.auth)
                 self.assertEqual(r.status, 200)
             r = await self.client.get('/api/machines', headers=self.auth)
-            self.assertEqual(r.status, 401)
+            self.assertEqual(r.status, 429)
+            self.assertEqual(r.headers['Retry-After'], '60')
             fresh = relay.make_app()
             self.assertTrue(relay.attempt(fresh, '127.0.0.1'))
             fresh[relay.SECURITY]['executor'].shutdown()
@@ -433,8 +473,9 @@ class RelayAuthTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(relay, 'IP_ATTEMPTS', 1):
             _, reply = await self.ws([])
             self.assertEqual(reply['type'], 'error')
-            r = await self.client.get('/api/machines', headers=self.auth)
-            self.assertEqual(r.status, 401)
+            _, second = await self.ws([])
+            self.assertEqual(second['status'], 429)
+            self.assertEqual((await self.client.get('/api/machines', headers=self.auth)).status, 200)
 
 
 if __name__ == '__main__':
