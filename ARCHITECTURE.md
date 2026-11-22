@@ -1,5 +1,9 @@
 # Architecture and Security Boundaries
 
+## Mobile access
+
+The Safari client is served from the relay's own origin in `mobile/`. All assets are local. The home-screen manifest opens the same HTTPS page. The client clears the passphrase after login and does not cache desktop frames or retain login state between visits. Desktop and phone share the bounded password verifier. A browser ticket pins a particular Host socket and remains in volatile relay memory. Each mobile connection takes the normal single-client slot. A visible Host dialog gates screen capture and input, stays open with a Stop control, and is dismissed on disconnect. Old Hosts cannot receive phone sessions.
+
 Three scripts: relay_server.py (aiohttp), host.py (Windows tkinter/capture/input),
 client.py (Windows tkinter/viewer/input). Protocol 2 authenticates before WebSocket
 upgrade. See PROTOCOL.md for fields and INSTALL_GUIDE.md for migration.

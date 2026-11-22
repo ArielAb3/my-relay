@@ -1,0 +1,19 @@
+{
+  "id": "/mobile/",
+  "name": "שולחן מרוחק",
+  "short_name": "שולחן מרוחק",
+  "lang": "he",
+  "dir": "rtl",
+  "start_url": "/mobile/",
+  "scope": "/mobile/",
+  "display": "standalone",
+  "background_color": "#101d2c",
+  "theme_color": "#122539",
+  "icons": [
+    {
+      "src": "icon.png",
+      "sizes": "512x512",
+      "type": "image/png"
+    }
+  ]
+}

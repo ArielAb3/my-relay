@@ -46,6 +46,7 @@ from concurrent.futures import ThreadPoolExecutor
 import base64
 import hmac
 import math
+from pathlib import Path
 from functools import wraps
 
 from aiohttp import web, WSMsgType
@@ -138,6 +139,10 @@ async def security_middleware(request, handler):
             response = web.Response(status=exc.status, text=exc.text, headers=exc.headers)
     if not response.prepared:
         set_security_headers(response)
+        if request.path.startswith('/mobile/'):
+            response.headers['Content-Security-Policy'] = (
+                "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' blob:; "
+                "connect-src 'self'; manifest-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'")
     return response
 
 
@@ -486,7 +491,8 @@ async def register_host(request, ws, mac, code, original_machine, original_contr
     m = original_machine.copy()
     session = {'host': ws, 'client': None, 'mac': mac,
                'password_salt': msg['password_salt'], 'password_hash': msg['password_hash'],
-               'allow_files': msg['allow_files'], 'host_token_hash': m['host_token_hash']}
+               'allow_files': msg['allow_files'], 'host_token_hash': m['host_token_hash'],
+               'mobile_capable': type(msg.get('mobile_consent')) is int and msg['mobile_consent'] == 1}
     m.update({'name': m.get('name') or name, 'code': code,
               'desired_code': m.get('desired_code', ''), 'online': True, 'version': version,
               'last_seen': time.time(), 'ip': transport_peer(request)})
@@ -504,6 +510,139 @@ async def register_host(request, ws, mac, code, original_machine, original_contr
 # ============================================================
 #  WebSocket endpoint
 # ============================================================
+def require_mobile_origin(request):
+    scheme = 'https' if request.secure or (os.environ.get('TRUST_PROXY') == '1' and
+                                           request.headers.get('X-Forwarded-Proto') == 'https') else 'http'
+    if request.headers.getall('Origin', []) != [scheme + '://' + request.host]:
+        raise web.HTTPForbidden(text='Invalid origin')
+
+
+def client_available(code, session):
+    return (session is not None and sessions.get(code) is session and not session['host'].closed
+            and session.get('client') is None
+            and machines.get(session['mac'], {}).get('host_token_hash') == session['host_token_hash'])
+
+
+async def authenticated_client(state, code, password):
+    if not valid_code(code) or not isinstance(password, str) or not 16 <= len(password) <= 128:
+        raise web.HTTPUnauthorized(text='Authentication failed')
+    try:
+        secret = password.encode('utf-8')
+    except UnicodeEncodeError:
+        raise web.HTTPUnauthorized(text='Authentication failed') from None
+    if len(secret) > 512:
+        raise web.HTTPUnauthorized(text='Authentication failed')
+    session = sessions.get(code)
+    if not client_available(code, session):
+        raise web.HTTPUnauthorized(text='Authentication failed')
+    if state['hash_count'] >= MAX_HASHES:
+        raise web.HTTPServiceUnavailable(text='Authentication failed')
+    state['hash_count'] += 1
+    future = asyncio.get_running_loop().run_in_executor(
+        state['executor'], hashlib.pbkdf2_hmac, 'sha256', secret,
+        bytes.fromhex(session['password_salt']), 600000, 32)
+    def release_hash(_):
+        state['hash_count'] -= 1
+    future.add_done_callback(release_hash)
+    digest = await asyncio.shield(future)
+    if not client_available(code, session) or not hmac.compare_digest(digest.hex(), session['password_hash'].lower()):
+        raise web.HTTPUnauthorized(text='Authentication failed')
+    return session
+
+
+async def mobile_login(request):
+    require_mobile_origin(request)
+    if not attempt(request.app, transport_peer(request)):
+        raise web.HTTPTooManyRequests()
+    data = await mutation_data(request, require_mac=False)
+    code = data.get('code')
+    if valid_code(code) and not attempt(request.app, None, code):
+        raise web.HTTPTooManyRequests()
+    state = request.app[SECURITY]
+    session = await authenticated_client(state, code, data.get('password'))
+    if not session.get('mobile_capable'):
+        raise web.HTTPConflict(text='Host update required')
+    tickets = state['mobile_tickets']
+    now = time.monotonic()
+    for key, (expires, _, _) in list(tickets.items()):
+        if expires <= now:
+            del tickets[key]
+    if len(tickets) >= MAX_WS:
+        raise web.HTTPServiceUnavailable()
+    ticket = secrets.token_urlsafe(32)
+    tickets[ticket] = (now + 30, code, session)
+    response = web.json_response({'ok': True})
+    response.set_cookie('rd_mobile', ticket, path='/mobile/ws', max_age=30, httponly=True,
+                        secure=True, samesite='Strict')
+    return response
+
+
+async def mobile_socket(request, ws):
+    require_mobile_origin(request)
+    entry = request.app[SECURITY]['mobile_tickets'].pop(request.cookies.get('rd_mobile', ''), None)
+    if not entry or entry[0] <= time.monotonic():
+        raise web.HTTPUnauthorized(text='Authentication failed')
+    _, code, session = entry
+    if not client_available(code, session):
+        raise web.HTTPUnauthorized(text='Authentication failed')
+    await ws.prepare(request)
+    if not client_available(code, session):
+        await ws.close(code=1008)
+        return ws
+    host = session['host']
+    request_id = secrets.token_hex(16)
+    session['client'] = ws
+    try:
+        async with asyncio.timeout(45) as deadline:
+            session['mobile'] = {'id': request_id, 'approved': False, 'deadline': deadline}
+            await ws.send_json({'type': 'waiting'})
+            await host.send_json({'type': 'mobile_request', 'id': request_id})
+            async for raw in ws:
+                if sessions.get(code) is not session or session['client'] is not ws:
+                    break
+                if (not session['mobile']['approved'] or raw.type != WSMsgType.BINARY
+                        or len(raw.data) < 6 or len(raw.data) > 134 or raw.data[0] not in (2, 3)
+                        or int.from_bytes(raw.data[1:5], 'big') != len(raw.data) - 5):
+                    await ws.close(code=1008, message=b'Invalid mobile input')
+                    break
+                await host.send_bytes(raw.data)
+    except TimeoutError:
+        await ws.send_json({'type': 'expired'})
+    finally:
+        # Never reuse a Host socket with an outstanding local approval or queued input.
+        # Keep client ownership until that socket closes.
+        if not host.closed:
+            await host.close(code=1000, message=b'Mobile session ended')
+        await ws.close()
+    return ws
+
+
+async def mobile_host_message(session, raw):
+    mobile = session['mobile']
+    phone = session['client']
+    if phone.closed:
+        return
+    if raw.type == WSMsgType.BINARY:
+        if mobile['approved'] and raw.data[:1] in (b'\x01', b'\x08'):
+            await phone.send_bytes(raw.data)
+        return
+    if raw.type != WSMsgType.TEXT or mobile['approved'] or len(raw.data) > 256:
+        return
+    message = json.loads(raw.data)
+    if not isinstance(message, dict) or message.get('type') != 'mobile_decision' or message.get('id') != mobile['id']:
+        return
+    if message.get('approved') is not True:
+        await phone.send_json({'type': 'denied'})
+        await phone.close(code=1008, message=b'Local approval declined')
+        return
+    if mobile['deadline'].expired():
+        return
+    mobile['deadline'].reschedule(None)
+    await phone.send_json({'type': 'connected', 'protocol': 2, 'allow_files': False})
+    await session['host'].send_json({'type': 'mobile_start', 'id': mobile['id']})
+    mobile['approved'] = True
+
+
 async def ws_endpoint(request):
     state = request.app[SECURITY]
     peer_ip = transport_peer(request)
@@ -511,7 +650,8 @@ async def ws_endpoint(request):
         return web.Response(status=503, text='Authentication failed')
     state['ws_count'] += 1
     state['ws_peers'][peer_ip] = state['ws_peers'].get(peer_ip, 0) + 1
-    ws = web.WebSocketResponse(max_msg_size=12 * 1024 * 1024, heartbeat=30, timeout=2)
+    limit = 256 if request.path == '/mobile/ws' else 12 * 1024 * 1024
+    ws = web.WebSocketResponse(max_msg_size=limit, heartbeat=30, timeout=2)
     set_security_headers(ws)
 
     role = code = mac = None
@@ -520,6 +660,8 @@ async def ws_endpoint(request):
     try:
         if not attempt(request.app, peer_ip):
             return web.Response(status=429, text='Authentication failed')
+        if request.path == '/mobile/ws':
+            return await mobile_socket(request, ws)
         headers = request.headers.getall('X-RemoteDesktop-Auth', [])
         if len(headers) != 1 or len(headers[0]) > 5464:
             raise ValueError('Authentication failed')
@@ -592,6 +734,9 @@ async def ws_endpoint(request):
                 if mac in machines:
                     machines[mac]['last_seen'] = time.time()
                     machines[mac]['online'] = True
+                if session.get('mobile'):
+                    await mobile_host_message(session, raw)
+                    continue
                 if raw.type == WSMsgType.BINARY:
                     cl = session.get('client')
                     if cl is not None and not cl.closed:
@@ -608,33 +753,9 @@ async def ws_endpoint(request):
 
         # ---------------- CLIENT ----------------
         elif role == 'client':
-            password = msg.get('password')
-            if (not valid_code(code) or not isinstance(password, str) or not 16 <= len(password) <= 128
-                    or len(password.encode('utf-8')) > 512):
-                raise ValueError('Authentication failed')
-            session = sessions.get(code)
-            if not session or session['host'].closed or session.get('client') is not None:
-                raise ValueError('Authentication failed')
-            if state['hash_count'] >= MAX_HASHES:
-                return web.Response(status=503, text='Authentication failed')
-            state['hash_count'] += 1
-            future = asyncio.get_running_loop().run_in_executor(
-                state['executor'], hashlib.pbkdf2_hmac, 'sha256', password.encode('utf-8'),
-                bytes.fromhex(session['password_salt']), 600000, 32)
-            # A cancelled request must not release capacity while its thread still runs.
-            def release_hash(_):
-                state['hash_count'] -= 1
-            future.add_done_callback(release_hash)
-            digest = await asyncio.shield(future)
-            if (sessions.get(code) is not session or session['host'].closed
-                    or session.get('client') is not None
-                    or machines.get(session['mac'], {}).get('host_token_hash') != session['host_token_hash']
-                    or not hmac.compare_digest(digest.hex(), session['password_hash'].lower())):
-                raise ValueError('Authentication failed')
+            session = await authenticated_client(state, code, msg.get('password'))
             await ws.prepare(request)
-            if (sessions.get(code) is not session or session['host'].closed
-                    or session.get('client') is not None
-                    or machines.get(session['mac'], {}).get('host_token_hash') != session['host_token_hash']):
+            if not client_available(code, session):
                 raise ValueError('Authentication failed')
             session['client'] = ws
             host_ws = session['host']
@@ -666,6 +787,10 @@ async def ws_endpoint(request):
 
         else:
             raise ValueError('Authentication failed')
+    except web.HTTPException:
+        if not ws.prepared:
+            raise
+        await ws.close(code=1008)
     except Exception as exc:
         if isinstance(exc, StateCommitError):
             await reconcile_state(exc)
@@ -687,7 +812,10 @@ async def ws_endpoint(request):
             elif is_client:
                 sessions[code]['client'] = None
             if other is not None and not other.closed:
-                try: await other.send_str(json.dumps({'type': 'disconnected'}))
+                try:
+                    await other.send_str(json.dumps({'type': 'disconnected'}))
+                    if is_host and session.get('mobile'):
+                        await other.close()
                 except Exception: pass
         if mac and mac in machines and host_ctrl.get(mac) is ws:
             machines[mac]['online'] = False
@@ -960,7 +1088,7 @@ DASHBOARD_HTML = r"""<!doctype html>
  .pill.onl{background:rgba(46,204,113,.15);color:var(--grn)}
 </style></head><body>
 <header><div><h1>ניהול חיבורים מרחוק</h1></div>
-<div id="count" class="pill"></div></header>
+<a href="/mobile/" style="color:#9edafa">חיבור מהטלפון</a><div id="count" class="pill"></div></header>
 <div class="wrap"><div id="loadStatus" role="status"></div><div id="list" class="grid"><div class="empty">טוען…</div></div></div>
 <script>
 function el(tag,cls,text){const n=document.createElement(tag);if(cls)n.className=cls;if(text!==undefined)n.textContent=String(text);return n;}
@@ -1029,7 +1157,7 @@ def make_app():
     app[SECURITY] = {'attempts': {}, 'dashboard_attempts': {}, 'ws_count': 0, 'ws_peers': {}, 'hash_count': 0,
                      'executor': ThreadPoolExecutor(max_workers=MAX_HASHES),
                      'state_lock': asyncio.Lock(), 'mutations': set(), 'state_failed': False, 'store': None,
-                     'pair_reads': 0, 'pair_peers': {}}
+                     'pair_reads': 0, 'pair_peers': {}, 'mobile_tickets': {}}
     async def startup(app):
         url = os.environ.get('DATABASE_URL')
         if url:
@@ -1053,6 +1181,14 @@ def make_app():
         app[SECURITY]['executor'].shutdown(wait=True, cancel_futures=True)
     app.on_startup.append(startup)
     app.on_cleanup.append(cleanup)
+    assets = Path(__file__).with_name('mobile')
+    for filename, route in (('index.html', ''), ('viewer.js', 'viewer.js'), ('app.css', 'app.css'),
+                            ('manifest.webmanifest', 'manifest.webmanifest'), ('icon.png', 'icon.png')):
+        async def asset(request, path=assets / filename):
+            return web.FileResponse(path)
+        app.router.add_get('/mobile/' + route, asset)
+    app.router.add_post('/mobile/login', mobile_login)
+    app.router.add_get('/mobile/ws', ws_endpoint)
     app.router.add_get('/ws', ws_endpoint)
     app.router.add_get('/config.json', config_json)
     app.router.add_get('/healthz', healthz)

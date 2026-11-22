@@ -1,5 +1,11 @@
 # Protocol 2 (Remote Desktop 2.0.0)
 
+## Attended phone sessions (2.2.0)
+
+The Host advertises `mobile_consent: 1` in its authenticated hello. On HTTPS the public same-origin page at `/mobile/` posts JSON `{code,password}` to `/mobile/login` with the RemoteDesktop custom header and an exact Origin. The relay applies the desktop password and rate checks. A successful response sets a Secure, HttpOnly, SameSite=Strict cookie restricted to `/mobile/ws`. Its one-use ticket expires in 30 seconds and is bound to the current Host session. The WebSocket upgrade checks Origin and consumes the ticket before upgrade. An authenticated operator with an older Host receives HTTP 409.
+
+The phone receives `waiting`; the relay sends `{type:"mobile_request",id}` to the Host. The Host responds with `{type:"mobile_decision",id,approved}` after a local decision. The relay requires an exact request ID, applies a 45-second approval deadline, and forwards no desktop frames while pending. A matching approval sends protocol-2 `connected` to the phone and `{type:"mobile_start",id}` to the Host. The Host checks this ID before capture/input. Only screen/tile frames to the phone and mouse/key frames to the Host are supported. Denial, expiry, local Stop or either socket disconnect ends the visit; the Host registers afresh. A new visit requires a new password check and local approval.
+
 Version 2.1.0 retains protocol 2 screen/input frames and authentication. It adds
 one-time HTTPS pairing; existing manually enrolled protocol-2 clients still work.
 

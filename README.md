@@ -1,4 +1,8 @@
-# Remote Desktop 2.1.0
+# Remote Desktop 2.2.0
+
+## iPhone Home Screen client (Host 2.2.0)
+
+Open `/mobile/` in Safari. Use Share → Add to Home Screen. Enter the computer code and operator passphrase. The Windows user must approve each visit and can end it from the sharing window. Tapping clicks, dragging moves with the button held, and the keyboard tool sends text or Enter/Backspace. Closing or backgrounding the app ends the visit. The Windows Client can continue using protocol 2. Version 2.1.0 Hosts need a one-time update for phone sessions. Future changes to the mobile interface load from the relay.
 
 This branch is the relay-only deployment subset. Desktop source and installer
 builds remain in the local remote_desktop_FULL workspace. Run relay tests here
