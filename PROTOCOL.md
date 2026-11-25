@@ -81,6 +81,8 @@ Host to Client: `{type:"file_result", ok:true, name}` after committed file recei
 
 ## Binary Frames
 
+Host 2.2.1 sends MSG_SCREEN for a full refresh and MSG_TILES for changed regions. The full JPEG and the following delta baseline are built from the same capture. A receiver must accept either frame type throughout a session, including older Hosts sending all tiles on a full refresh.
+
 All integers big-endian. Each message is exactly `[type:u8][length:u32][payload]`.
 Trailing/truncated bytes are invalid. Authenticated WebSocket maximum: 12 MiB.
 

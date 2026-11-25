@@ -1,4 +1,10 @@
-# Remote Desktop 2.2.0
+# Remote Desktop 2.2.1
+
+## Display updates and saved computers (2.2.1)
+
+Host uses one full JPEG on first capture, periodic refresh, resolution change, or when every tile changes. Sparse changes use the existing tile format. Windows Client decodes JPEGs off the Tk thread, keeps a single display image, and updates the affected region at the current zoom. Existing protocol-2 frames remain supported.
+
+On Windows or the iPhone page, enter a six-digit computer code and use the save-by-name control. Choosing a saved name fills the code. Saved lists are local to the device and relay. Removing a name clears that local shortcut. Each connection still requires its access passphrase.
 
 ## iPhone Home Screen client (Host 2.2.0)
 

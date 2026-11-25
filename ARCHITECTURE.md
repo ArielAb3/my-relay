@@ -1,5 +1,9 @@
 # Architecture and Security Boundaries
 
+## Display pipeline (2.2.1)
+
+The Host advances tile hashes from the same snapshot that produced a full JPEG. A single Windows worker task per incoming frame decodes and validates the whole update before the Tk thread composites it. The Tk canvas keeps one image item. A delta repaints its changed bounding rectangle with a border for the bilinear filter; window resizes redraw the full image.
+
 ## Mobile access
 
 The Safari client is served from the relay's own origin in `mobile/`. All assets are local. The home-screen manifest opens the same HTTPS page. The client clears the passphrase after login and does not cache desktop frames or retain login state between visits. Desktop and phone share the bounded password verifier. A browser ticket pins a particular Host socket and remains in volatile relay memory. Each mobile connection takes the normal single-client slot. A visible Host dialog gates screen capture and input, stays open with a Stop control, and is dismissed on disconnect. Old Hosts cannot receive phone sessions.

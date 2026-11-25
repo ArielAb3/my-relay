@@ -8,10 +8,17 @@
 <link rel="stylesheet" href="./app.css"><script defer src="./viewer.js"></script></head>
 <body><main>
 <header><img src="./icon.png" alt="" width="42" height="42"><h1>שולחן מרוחק</h1><button id="end" class="secondary" hidden>ניתוק</button></header>
-<section id="login"><h2>חיבור למחשב</h2><form id="credentials">
+<section id="login"><h2>חיבור למחשב</h2>
+<div id="savedList" hidden><label for="saved">המחשבים שלי</label><select id="saved"></select></div>
+<form id="credentials">
 <label for="code">קוד המחשב</label><input id="code" dir="ltr" type="text" inputmode="numeric" pattern="[0-9]{6}" maxlength="6" required autocomplete="off">
 <label for="pass">סיסמת הגישה</label><input id="pass" type="password" minlength="16" maxlength="128" required dir="auto" autocomplete="off">
 <button id="join" type="submit">בקשת חיבור</button></form>
+<details id="manageNames"><summary>שמירה בשם במכשיר הזה</summary>
+<label for="alias">שם למחשב</label><input id="alias" maxlength="40" autocomplete="off" dir="auto">
+<div class="tools"><button type="button" id="saveAlias">שמירת שם וקוד</button>
+<button type="button" id="forgetAlias" class="secondary" hidden>הסרה מהרשימה</button></div>
+<span role="status" id="aliasStatus"></span></details>
 <details><summary>הוספה למסך הבית באייפון</summary><p>ב־Safari בחרו ״שיתוף״, ואז ״הוספה למסך הבית״ ו״הוסף״.</p></details></section>
 <p id="status" role="status" aria-live="polite"></p>
 <section id="viewer" hidden aria-label="המסך המשותף"><canvas id="screen" width="1" height="1" aria-label="המסך המרוחק. הקשה ללחיצה וגרירה להזזה עם לחצן לחוץ"></canvas>

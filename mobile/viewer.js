@@ -6,6 +6,53 @@ const statusLine = byId('status');
 let visitor = null, pointer = null, last = null, motion = 0;
 const say = text => {statusLine.textContent = text;};
 
+
+const savedKey = 'remote-desktop.named-computers.v1';
+function readNames() {
+    try {
+        const value = JSON.parse(localStorage.getItem(savedKey) || '{}');
+        if (!value || typeof value !== 'object' || Array.isArray(value)) return {};
+        return Object.fromEntries(Object.entries(value).filter(([code, name]) =>
+            /^[0-9]{6}$/.test(code) && typeof name === 'string' && name.trim() && name.length <= 40));
+    } catch { return {}; }
+}
+
+function refreshNames() {
+    const names = readNames(), code = byId('code').value;
+    const list = byId('saved');
+    list.replaceChildren(new Option('בחירת מחשב', ''));
+    for (const [id, name] of Object.entries(names).sort((a,b)=>a[1].localeCompare(b[1], 'he'))) {
+        list.add(new Option(name + ' · ' + id, id));
+    }
+    list.value = Object.hasOwn(names, code) ? code : '';
+    byId('savedList').hidden = list.length <= 1;
+    byId('alias').value = names[code] || '';
+    byId('forgetAlias').hidden = !Object.hasOwn(names, code);
+    byId('aliasStatus').textContent = '';
+}
+function editName(remove) {
+    const names = readNames(), code = byId('code').value, name = byId('alias').value.trim();
+    if (!/^[0-9]{6}$/.test(code) || (!remove && (!name || name.length > 40 || /[\p{C}]/u.test(name)))) {
+        byId('aliasStatus').textContent = 'הזן קוד מחשב בן שש ספרות ושם באורך 1–40 תווים.';
+        return;
+    }
+    if (remove) delete names[code]; else names[code] = name;
+    try { localStorage.setItem(savedKey, JSON.stringify(names)); }
+    catch { byId('aliasStatus').textContent = 'הדפדפן לא הצליח לשמור במכשיר הזה.'; return; }
+    refreshNames();
+    byId('aliasStatus').textContent = remove ? 'המחשב הוסר מהרשימה.' : 'השם והקוד נשמרו במכשיר הזה.';
+}
+byId('saved').addEventListener('change', () => {
+    byId('code').value = byId('saved').value;
+    refreshNames();
+    byId('pass').focus();
+});
+byId('code').addEventListener('input', refreshNames);
+byId('saveAlias').onclick = () => editName(false);
+byId('forgetAlias').onclick = () => editName(true);
+window.addEventListener('storage', event => { if (!event.key || event.key === savedKey) refreshNames(); });
+refreshNames();
+
 function endVisit(message) {
     const old = visitor;
     visitor = null;
